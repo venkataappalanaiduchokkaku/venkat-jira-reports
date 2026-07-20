@@ -1,37 +1,66 @@
 #!/usr/bin/env python3
-"""Generate the weekly EDA Jira ticket categorization workbook."""
+"""Generate the weekly EDA Jira ticket categorization workbook.
+
+The script consumes the JSON returned by Jira's issue search API and updates a
+copy of ``EDA_Ticket_Categorization.xlsx``.  Existing template category
+assignments are retained; new tickets are categorized by deterministic rules.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-from collections import Counter, defaultdict
+from collections import Counter
+from copy import copy
 from datetime import date
 from pathlib import Path
 from typing import Any
 
-from openpyxl import Workbook
-from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 
 
 STATUS_ORDER = ("Open", "In Progress", "Resolved", "Closed")
+CATEGORIES = (
+    "Snowflake Provisioning",
+    "AWS Provisioning",
+    "CI/CD Setup / Github",
+    "Analytics/Feature Request",
+)
 STATUS_COLORS = {
     "Open": "D9EAF7",
     "In Progress": "FFF2CC",
     "Resolved": "E2F0D9",
     "Closed": "D9D9D9",
 }
-HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
-SUBHEADER_FILL = PatternFill("solid", fgColor="5B9BD5")
-TOTAL_FILL = PatternFill("solid", fgColor="DDEBF7")
-WHITE_BOLD_FONT = Font(color="FFFFFF", bold=True)
-THIN_BLUE_BORDER = Border(
-    left=Side(style="thin", color="B4C6E7"),
-    right=Side(style="thin", color="B4C6E7"),
-    top=Side(style="thin", color="B4C6E7"),
-    bottom=Side(style="thin", color="B4C6E7"),
+RAW_SHEET = "Ticket Categorization"
+SUMMARY_SHEET = "Summary"
+RAW_HEADERS = ("Ticket", "Title", "Category", "Status")
+SUMMARY_HEADERS = ("Category", "Count", *STATUS_ORDER)
+
+CI_CD_TERMS = (
+    "ci/cd",
+    "github",
+    "git hub",
+    "repository",
+    " repo",
+)
+AWS_TERMS = ("aws", "s3", "acre folder")
+SNOWFLAKE_TERMS = (
+    "snowflake",
+    "warehouse",
+    "schema",
+    " role",
+    "rbac",
+    "polaris",
+    "cortex",
+    "external stage",
+    "datashare",
+    "data share",
+    "posit",
+    "ontology",
+    "private listing",
+    "iceberg",
 )
 
 
@@ -40,7 +69,12 @@ def value_name(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, dict):
-        return str(value.get("name") or value.get("value") or "")
+        return str(
+            value.get("name")
+            or value.get("value")
+            or value.get("displayName")
+            or ""
+        )
     return str(value)
 
 
@@ -64,48 +98,68 @@ def normalize_status(jira_status: str, status_category_key: str) -> str:
     return "Open"
 
 
-def normalize_issue(issue: dict[str, Any]) -> dict[str, str]:
+def classify_issue(fields: dict[str, Any], template_category: str = "") -> str:
+    """Classify an issue into the category taxonomy used by the template."""
+    if template_category:
+        return template_category
+
+    jira_category = value_name(fields.get("customfield_19840"))
+    if jira_category:
+        for category in CATEGORIES:
+            if category.casefold() in jira_category.casefold():
+                return jira_category
+
+    text = " ".join(
+        (
+            str(fields.get("summary") or ""),
+            joined_names(fields.get("components")),
+            joined_names(fields.get("labels")),
+        )
+    ).casefold()
+    if any(term in text for term in CI_CD_TERMS):
+        return "CI/CD Setup / Github"
+    if any(term in text for term in AWS_TERMS):
+        return "AWS Provisioning"
+    if any(term in text for term in SNOWFLAKE_TERMS):
+        return "Snowflake Provisioning"
+    return "Analytics/Feature Request"
+
+
+def normalize_issue(
+    issue: dict[str, Any], template_categories: dict[str, str]
+) -> dict[str, str]:
     """Normalize either a Jira API issue or a pre-normalized issue object."""
     fields = issue.get("fields", issue)
     status = fields.get("status") or {}
-    issue_type = value_name(fields.get("issuetype") or fields.get("issue_type"))
     jira_status = value_name(status) or str(fields.get("jira_status") or "")
     category_key = (
         status.get("statusCategory", {}).get("key", "")
         if isinstance(status, dict)
         else ""
     ) or str(fields.get("status_category_key") or "")
-    category = value_name(fields.get("customfield_19840") or fields.get("category"))
+    key = str(issue.get("key") or fields.get("key") or "")
 
     return {
-        "key": str(issue.get("key") or fields.get("key") or ""),
-        "summary": str(fields.get("summary") or ""),
+        "key": key,
+        "title": str(fields.get("summary") or fields.get("title") or ""),
         "status_group": str(
             fields.get("normalized_status")
             or normalize_status(jira_status, category_key)
         ),
-        "jira_status": jira_status,
-        # EDA's Jira Category custom field is currently unpopulated. Issue Type
-        # provides a stable, meaningful category without losing any tickets.
-        "category": category or issue_type or "Uncategorized",
-        "issue_type": issue_type,
-        "priority": value_name(fields.get("priority")),
-        "assignee": value_name(fields.get("assignee")),
-        "reporter": value_name(fields.get("reporter")),
-        "created": str(fields.get("created") or ""),
-        "updated": str(fields.get("updated") or ""),
-        "resolution": value_name(fields.get("resolution")),
-        "components": joined_names(fields.get("components")),
-        "labels": joined_names(fields.get("labels")),
+        "category": classify_issue(fields, template_categories.get(key, "")),
     }
 
 
-def load_issues(path: Path) -> list[dict[str, str]]:
+def load_issues(
+    path: Path, template_categories: dict[str, str]
+) -> list[dict[str, str]]:
     """Load and normalize issues from JSON."""
     with path.open(encoding="utf-8") as source:
         payload = json.load(source)
     issues = payload.get("issues", []) if isinstance(payload, dict) else payload
-    normalized = [normalize_issue(issue) for issue in issues]
+    normalized = [
+        normalize_issue(issue, template_categories) for issue in issues
+    ]
     if not normalized:
         raise ValueError("The input contains no Jira issues")
     if any(not issue["key"] for issue in normalized):
@@ -113,190 +167,128 @@ def load_issues(path: Path) -> list[dict[str, str]]:
     return sorted(normalized, key=lambda issue: issue["key"])
 
 
-def style_header(ws: Any, row: int, start: int, end: int) -> None:
-    for cell in ws.iter_cols(
-        min_col=start, max_col=end, min_row=row, max_row=row
-    ):
-        header = cell[0]
-        header.fill = HEADER_FILL
-        header.font = WHITE_BOLD_FONT
-        header.alignment = Alignment(horizontal="center", vertical="center")
-        header.border = THIN_BLUE_BORDER
+def template_category_assignments(ws: Any) -> dict[str, str]:
+    """Return the manually curated ticket categories embedded in the template."""
+    return {
+        str(ticket): str(category)
+        for ticket, _, category, _ in ws.iter_rows(
+            min_row=2, min_col=1, max_col=4, values_only=True
+        )
+        if ticket and category
+    }
 
 
-def build_raw_sheet(wb: Workbook, issues: list[dict[str, str]]) -> None:
-    ws = wb.active
-    ws.title = "Raw Tickets"
-    headers = [
-        "Ticket",
-        "Summary",
-        "Status Group",
-        "Jira Status",
-        "Category",
-        "Issue Type",
-        "Priority",
-        "Assignee",
-        "Reporter",
-        "Created",
-        "Updated",
-        "Resolution",
-        "Components",
-        "Labels",
-    ]
-    ws.append(headers)
+def build_raw_sheet(ws: Any, issues: list[dict[str, str]]) -> None:
+    """Replace the template's ticket rows while preserving its presentation."""
+    header_styles = [copy(cell._style) for cell in ws[1][:4]]
+    data_styles = [copy(cell._style) for cell in ws[2][:4]]
+    data_height = ws.row_dimensions[2].height
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    for column, header in enumerate(RAW_HEADERS, start=1):
+        cell = ws.cell(1, column, header)
+        cell._style = header_styles[column - 1]
+
     for issue in issues:
         ws.append(
             [
                 issue["key"],
-                issue["summary"],
-                issue["status_group"],
-                issue["jira_status"],
+                issue["title"],
                 issue["category"],
-                issue["issue_type"],
-                issue["priority"],
-                issue["assignee"],
-                issue["reporter"],
-                issue["created"],
-                issue["updated"],
-                issue["resolution"],
-                issue["components"],
-                issue["labels"],
+                issue["status_group"],
             ]
         )
 
-    style_header(ws, 1, 1, len(headers))
-    ws.row_dimensions[1].height = 28
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
-    ws.sheet_view.showGridLines = False
-    widths = [15, 70, 16, 16, 18, 15, 16, 31, 31, 25, 25, 16, 28, 24]
-    for index, width in enumerate(widths, start=1):
-        ws.column_dimensions[chr(64 + index)].width = width
-
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        for cell in row:
-            cell.border = THIN_BLUE_BORDER
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-        key_cell = row[0]
+    for row_number, row in enumerate(
+        ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=4), start=2
+    ):
+        ws.row_dimensions[row_number].height = data_height
+        for index, cell in enumerate(row):
+            cell._style = copy(data_styles[index])
+        key_cell, _, _, status_cell = row
         key_cell.hyperlink = f"https://wbdprod.atlassian.net/browse/{key_cell.value}"
         key_cell.style = "Hyperlink"
-
-    table = Table(displayName="RawTickets", ref=ws.dimensions)
-    table.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium2",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=True,
-        showColumnStripes=False,
-    )
-    ws.add_table(table)
-
-    for status, color in STATUS_COLORS.items():
-        ws.conditional_formatting.add(
-            f"C2:C{ws.max_row}",
-            FormulaRule(
-                formula=[f'$C2="{status}"'],
-                fill=PatternFill("solid", fgColor=color),
-            ),
+        status_cell.fill = PatternFill(
+            "solid", fgColor=STATUS_COLORS[status_cell.value]
         )
 
 
-def build_summary_sheet(
-    wb: Workbook, issues: list[dict[str, str]], report_date: date
-) -> None:
-    ws = wb.create_sheet("Summary", 0)
-    ws.sheet_view.showGridLines = False
-    ws.merge_cells("A1:F1")
-    ws["A1"] = "EDA Ticket Categorization Summary"
-    ws["A1"].fill = HEADER_FILL
-    ws["A1"].font = Font(color="FFFFFF", bold=True, size=16)
-    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 32
+def rollup_category(category: str) -> str:
+    """Map template subcategories to one of the four summary categories."""
+    for summary_category in CATEGORIES:
+        if summary_category.casefold() in category.casefold():
+            return summary_category
+    return "Analytics/Feature Request"
 
-    assignees = sorted({issue["assignee"] for issue in issues if issue["assignee"]})
-    metadata = [
-        ("Report week", report_date.isoformat()),
-        ("Assignee", ", ".join(assignees)),
-        ("Total tickets", len(issues)),
-        ("Category basis", "Jira Category; Issue Type when Category is empty"),
-    ]
-    for row_number, (label, value) in enumerate(metadata, start=3):
-        ws.cell(row_number, 1, label).font = Font(bold=True, color="1F4E78")
-        ws.cell(row_number, 2, value)
 
-    matrix_start = 9
-    matrix_headers = ["Category", *STATUS_ORDER, "Total"]
-    for column, header in enumerate(matrix_headers, start=1):
-        ws.cell(matrix_start, column, header)
-    style_header(ws, matrix_start, 1, len(matrix_headers))
+def build_summary_sheet(ws: Any, issues: list[dict[str, str]]) -> None:
+    """Build category-by-status counts using the template's summary layout."""
+    header_styles = [copy(cell._style) for cell in ws[1][:4]]
+    data_styles = [copy(cell._style) for cell in ws[2][:4]]
+    header_height = ws.row_dimensions[1].height
+    data_height = ws.row_dimensions[2].height
+    ws.delete_rows(1, ws.max_row)
 
-    counts: dict[str, Counter[str]] = defaultdict(Counter)
-    for issue in issues:
-        counts[issue["category"]][issue["status_group"]] += 1
-
-    row_number = matrix_start + 1
-    for category in sorted(counts):
-        ws.cell(row_number, 1, category)
-        for column, status in enumerate(STATUS_ORDER, start=2):
-            ws.cell(row_number, column, counts[category][status])
-        ws.cell(
-            row_number,
-            len(matrix_headers),
-            sum(counts[category].values()),
+    for column, header in enumerate(SUMMARY_HEADERS, start=1):
+        cell = ws.cell(1, column, header)
+        cell._style = copy(
+            header_styles[min(column - 1, len(header_styles) - 1)]
         )
-        row_number += 1
+    ws.row_dimensions[1].height = header_height
 
-    total_row = row_number
-    ws.cell(total_row, 1, "Total")
-    overall = Counter(issue["status_group"] for issue in issues)
-    for column, status in enumerate(STATUS_ORDER, start=2):
-        ws.cell(total_row, column, overall[status])
-    ws.cell(total_row, len(matrix_headers), len(issues))
+    counts = {
+        category: Counter(
+            issue["status_group"]
+            for issue in issues
+            if rollup_category(issue["category"]) == category
+        )
+        for category in CATEGORIES
+    }
+    for row_number, category in enumerate(CATEGORIES, start=2):
+        category_counts = counts[category]
+        values = [
+            category,
+            sum(category_counts.values()),
+            *(category_counts[status] for status in STATUS_ORDER),
+        ]
+        for column, value in enumerate(values, start=1):
+            cell = ws.cell(row_number, column, value)
+            cell._style = copy(
+                data_styles[min(column - 1, len(data_styles) - 1)]
+            )
+        ws.row_dimensions[row_number].height = data_height
 
-    for row in ws.iter_rows(
-        min_row=matrix_start + 1,
-        max_row=total_row,
-        min_col=1,
-        max_col=len(matrix_headers),
-    ):
-        for cell in row:
-            cell.border = THIN_BLUE_BORDER
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-        row[0].alignment = Alignment(horizontal="left", vertical="center")
-    for cell in ws[total_row]:
-        if cell.column <= len(matrix_headers):
-            cell.fill = TOTAL_FILL
-            cell.font = Font(bold=True)
-
-    status_start = total_row + 3
-    ws.cell(status_start, 1, "Status")
-    ws.cell(status_start, 2, "Count")
-    style_header(ws, status_start, 1, 2)
-    for offset, status in enumerate(STATUS_ORDER, start=1):
-        row = status_start + offset
-        ws.cell(row, 1, status)
-        ws.cell(row, 2, overall[status])
-        for cell in ws[row][:2]:
-            cell.border = THIN_BLUE_BORDER
-        ws.cell(row, 1).fill = PatternFill("solid", fgColor=STATUS_COLORS[status])
-
-    ws.freeze_panes = "A9"
-    ws.column_dimensions["A"].width = 28
-    ws.column_dimensions["B"].width = 19
-    ws.column_dimensions["C"].width = 19
-    ws.column_dimensions["D"].width = 19
-    ws.column_dimensions["E"].width = 19
+    ws.column_dimensions["C"].width = 14
+    ws.column_dimensions["D"].width = 14
+    ws.column_dimensions["E"].width = 14
     ws.column_dimensions["F"].width = 14
 
 
-def generate_report(input_path: Path, output_path: Path, report_date: date) -> None:
-    issues = load_issues(input_path)
-    wb = Workbook()
+def generate_report(
+    input_path: Path,
+    output_path: Path,
+    report_date: date,
+    template_path: Path,
+) -> None:
+    wb = load_workbook(template_path)
+    missing_sheets = {RAW_SHEET, SUMMARY_SHEET} - set(wb.sheetnames)
+    if missing_sheets:
+        raise ValueError(
+            f"Template is missing required sheets: {sorted(missing_sheets)}"
+        )
+
+    template_categories = template_category_assignments(wb[RAW_SHEET])
+    issues = load_issues(input_path, template_categories)
+    build_raw_sheet(wb[RAW_SHEET], issues)
+    build_summary_sheet(wb[SUMMARY_SHEET], issues)
     wb.properties.title = "EDA Ticket Categorization"
     wb.properties.subject = f"Weekly Jira report for {report_date.isoformat()}"
     wb.properties.creator = "EDA Jira report automation"
-    build_raw_sheet(wb, issues)
-    build_summary_sheet(wb, issues, report_date)
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
 
@@ -311,9 +303,20 @@ def parse_args() -> argparse.Namespace:
         default=date.today(),
         help="Report week date in YYYY-MM-DD format (default: today)",
     )
+    parser.add_argument(
+        "--template",
+        type=Path,
+        default=Path("EDA_Ticket_Categorization.xlsx"),
+        help="Template workbook path",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     arguments = parse_args()
-    generate_report(arguments.input, arguments.output, arguments.report_date)
+    generate_report(
+        arguments.input,
+        arguments.output,
+        arguments.report_date,
+        arguments.template,
+    )
