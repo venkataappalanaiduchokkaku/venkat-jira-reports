@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import Counter
 from copy import copy
 from datetime import date
@@ -62,6 +63,9 @@ SNOWFLAKE_TERMS = (
     "private listing",
     "iceberg",
 )
+DESCRIPTION_CATEGORY_PATTERN = re.compile(
+    r"(?im)^\*\*Category:\*\*\s*([^\r\n]+)"
+)
 
 
 def value_name(value: Any) -> str:
@@ -87,6 +91,24 @@ def joined_names(value: Any) -> str:
     return ", ".join(value_name(item) for item in value if value_name(item))
 
 
+def description_category(value: Any) -> str:
+    """Return a report category from Jira's structured description field."""
+    if not isinstance(value, str):
+        return ""
+    match = DESCRIPTION_CATEGORY_PATTERN.search(value)
+    if not match:
+        return ""
+
+    category = match.group(1).casefold()
+    if "ci/cd" in category or "github" in category:
+        return "CI/CD Setup / Github"
+    if "aws" in category:
+        return "AWS Provisioning"
+    if "snowflake" in category:
+        return "Snowflake Provisioning"
+    return ""
+
+
 def normalize_status(jira_status: str, status_category_key: str) -> str:
     """Map Jira statuses into the four report status groups."""
     if jira_status.casefold() == "closed":
@@ -108,6 +130,10 @@ def classify_issue(fields: dict[str, Any], template_category: str = "") -> str:
         for category in CATEGORIES:
             if category.casefold() in jira_category.casefold():
                 return jira_category
+
+    structured_category = description_category(fields.get("description"))
+    if structured_category:
+        return structured_category
 
     text = " ".join(
         (
